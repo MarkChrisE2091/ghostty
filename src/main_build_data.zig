@@ -47,5 +47,10 @@ pub fn main() !void {
         .@"vim-compiler" => try writer.writeAll(@import("extra/vim.zig").compiler),
         .terminfo => try @import("terminfo/ghostty.zig").ghostty.encode(writer),
     }
-    try stdout_writer.end();
+    // On Windows, stdout may be a pipe or console which can't be ftruncated.
+    // The writer has already flushed, so swallow the platform-specific error.
+    stdout_writer.end() catch |err| switch (err) {
+        error.FileTooBig => {}, // Windows: can't ftruncate a pipe/console handle
+        else => return err,
+    };
 }

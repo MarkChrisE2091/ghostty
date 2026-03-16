@@ -23,7 +23,13 @@ pub fn main() !void {
     try genConfig(alloc, writer);
     try genActions(alloc, writer);
     try genKeybindActions(alloc, writer);
-    try stdout.end();
+    // On Windows, stdout may be a pipe or console handle which does not
+    // support ftruncate. The buffered writer already flushed above, so
+    // swallow the truncation-specific error and let other errors propagate.
+    stdout.end() catch |err| switch (err) {
+        error.FileTooBig => {}, // Windows: can't ftruncate a pipe/console handle
+        else => return err,
+    };
 }
 
 fn genConfig(alloc: std.mem.Allocator, writer: *std.Io.Writer) !void {

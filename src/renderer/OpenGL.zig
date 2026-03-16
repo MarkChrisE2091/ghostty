@@ -45,6 +45,7 @@ blending: configpkg.Config.AlphaBlending,
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
 
+
 /// NOTE: This is an error{}!OpenGL instead of just OpenGL for parity with
 ///       Metal, since it needs to be fallible so does this, even though it
 ///       can't actually fail.
@@ -174,6 +175,10 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
             // to compile for OpenGL targets but libghostty is strictly
             // broken for rendering on this platforms.
         },
+
+        // Windows uses WGL for OpenGL context management. The context
+        // is created and made current by the apprt before calling here.
+        apprt.win32 => try prepareContext(null),
     }
 
     // These are very noisy so this is commented, but easy to uncomment
@@ -190,13 +195,40 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 /// thread for final main thread setup requirements.
 pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
-    _ = surface;
+
+    switch (apprt.runtime) {
+        else => {},
+
+        // Release the WGL context from the main thread so the renderer
+        // thread can make it current in threadEnter. WGL contexts can
+        // only be current on one thread at a time.
+        apprt.win32 => {
+            _ = surface;
+            const wgl = @import("../apprt/windows/wgl.zig");
+            try wgl.makeCurrent(null, null);
+        },
+    }
 }
 
 /// Callback called by renderer.Thread when it begins.
+/// HDC stored by the renderer thread for SwapBuffers in drawFrameEnd.
+/// This is set in threadEnter and used in drawFrameEnd. Only the
+/// renderer thread accesses this, so no synchronization is needed.
+var win32_thread_hdc: ?*anyopaque = null;
+
+/// Pending window size set by the main thread (WM_SIZE), read by
+/// the renderer thread in drawFrameStart to update glViewport.
+/// Packed as (width << 32 | height), or 0 if no pending resize.
+var win32_pending_size: std.atomic.Value(u64) = .init(0);
+
+/// Called from the main thread to notify the renderer of a new size.
+pub fn win32SetPendingSize(width: u32, height: u32) void {
+    const val: u64 = (@as(u64, width) << 32) | @as(u64, height);
+    win32_pending_size.store(val, .release);
+}
+
 pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
-    _ = surface;
 
     switch (apprt.runtime) {
         else => @compileError("unsupported app runtime for OpenGL"),
@@ -212,6 +244,17 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
             // TODO(mitchellh): this does nothing today to allow libghostty
             // to compile for OpenGL targets but libghostty is strictly
             // broken for rendering on this platforms.
+        },
+
+        apprt.win32 => {
+            // Make the WGL context current on this renderer thread, then
+            // load GLAD. gl.glad.context is thread-local so it must be
+            // loaded separately on each thread that uses OpenGL.
+            const wgl = @import("../apprt/windows/wgl.zig");
+            try wgl.makeCurrent(surface.hdc, surface.hglrc);
+            try prepareContext(null);
+            // Store HDC for SwapBuffers in drawFrameEnd
+            win32_thread_hdc = surface.hdc;
         },
     }
 }
@@ -231,6 +274,14 @@ pub fn threadExit(self: *const OpenGL) void {
         apprt.embedded => {
             // TODO: see threadEnter
         },
+
+        apprt.win32 => {
+            // Unload GLAD for this thread and release the WGL context.
+            gl.glad.unload();
+            win32_thread_hdc = null;
+            const wgl = @import("../apprt/windows/wgl.zig");
+            wgl.makeCurrent(null, null) catch {};
+        },
     }
 }
 
@@ -245,22 +296,49 @@ pub fn displayRealized(self: *const OpenGL) void {
             );
         },
 
-        else => @compileError("only GTK should be calling displayRealized"),
+        apprt.win32 => prepareContext(null) catch |err| {
+            log.warn(
+                "Error preparing GL context in displayRealized, err={}",
+                .{err},
+            );
+        },
+
+        else => @compileError("only GTK/Windows should be calling displayRealized"),
     }
 }
 
 /// Actions taken before doing anything in `drawFrame`.
-///
-/// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameStart(self: *OpenGL) void {
     _ = self;
+    switch (apprt.runtime) {
+        apprt.win32 => {
+            // Check if the main thread posted a new window size.
+            // If so, update glViewport so the renderer matches the window.
+            const pending = win32_pending_size.swap(0, .acquire);
+            if (pending != 0) {
+                const w: gl.c.GLsizei = @intCast(pending >> 32);
+                const h: gl.c.GLsizei = @intCast(pending & 0xFFFFFFFF);
+                gl.glad.context.Viewport.?(0, 0, w, h);
+            }
+        },
+        else => {},
+    }
 }
 
 /// Actions taken after `drawFrame` is done.
-///
-/// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameEnd(self: *OpenGL) void {
     _ = self;
+    switch (apprt.runtime) {
+        apprt.win32 => {
+            // SwapBuffers must be called from the renderer thread which
+            // owns the WGL context. This presents the completed frame.
+            if (win32_thread_hdc) |hdc| {
+                const wgl = @import("../apprt/windows/wgl.zig");
+                wgl.swapBuffers(hdc);
+            }
+        },
+        else => {},
+    }
 }
 
 pub fn initShaders(

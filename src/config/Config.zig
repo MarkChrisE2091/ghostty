@@ -4578,6 +4578,15 @@ pub fn finalize(self: *Config) !void {
             switch (builtin.os.tag) {
                 .windows => {
                     if (self.command == null) {
+                        // Try to detect the best shell via passwd (prefers PowerShell)
+                        if (internal_os.passwd.get(alloc)) |pw| {
+                            if (pw.shell) |shell| {
+                                log.info("default shell src=passwd value={s}", .{shell});
+                                self.command = .{ .shell = shell };
+                            }
+                        } else |_| {}
+                    }
+                    if (self.command == null) {
                         log.warn("no default shell found, will default to using cmd", .{});
                         self.command = .{ .shell = "cmd.exe" };
                     }
@@ -4623,7 +4632,7 @@ pub fn finalize(self: *Config) !void {
 
     // Apprt-specific defaults
     switch (build_config.app_runtime) {
-        .none => {},
+        .none, .windows => {},
         .gtk => {
             switch (self.@"gtk-single-instance") {
                 .true, .false => {},
@@ -9026,7 +9035,7 @@ pub const GtkTitlebarStyle = enum(c_int) {
             .{ .name = "GhosttyGtkTitlebarStyle" },
         ),
 
-        .none => void,
+        .none, .windows => void,
     };
 };
 
@@ -9741,7 +9750,7 @@ pub const WindowDecoration = enum(c_int) {
             .{ .name = "GhosttyConfigWindowDecoration" },
         ),
 
-        .none => void,
+        .none, .windows => void,
     };
 
     pub fn parseCLI(input_: ?[]const u8) !WindowDecoration {

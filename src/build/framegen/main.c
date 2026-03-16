@@ -1,10 +1,73 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
 #include <errno.h>
 #include <zlib.h>
+
+#ifdef _WIN32
+#include <windows.h>
+
+/* Minimal dirent shim for Windows */
+struct dirent {
+    char d_name[MAX_PATH];
+};
+
+/* Windows implementation of scandir using FindFirstFile/FindNextFile.
+   Entries are sorted with qsort using the provided comparator. */
+static int scandir(
+    const char *dir,
+    struct dirent ***namelist,
+    int (*filter)(const struct dirent *),
+    int (*compar)(const struct dirent **, const struct dirent **)
+) {
+    char pattern[MAX_PATH];
+    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+
+    WIN32_FIND_DATAA fdata;
+    HANDLE h = FindFirstFileA(pattern, &fdata);
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    int capacity = 64;
+    int count = 0;
+    struct dirent **list = malloc(capacity * sizeof(struct dirent *));
+    if (!list) { FindClose(h); return -1; }
+
+    do {
+        struct dirent *entry = malloc(sizeof(struct dirent));
+        if (!entry) { FindClose(h); return -1; }
+        strncpy(entry->d_name, fdata.cFileName, MAX_PATH - 1);
+        entry->d_name[MAX_PATH - 1] = '\0';
+
+        if (!filter || filter(entry)) {
+            if (count == capacity) {
+                capacity *= 2;
+                struct dirent **tmp = realloc(list, capacity * sizeof(struct dirent *));
+                if (!tmp) { free(entry); FindClose(h); return -1; }
+                list = tmp;
+            }
+            list[count++] = entry;
+        } else {
+            free(entry);
+        }
+    } while (FindNextFileA(h, &fdata));
+
+    FindClose(h);
+
+    if (compar && count > 1)
+        qsort(list, count, sizeof(struct dirent *),
+              (int (*)(const void *, const void *))compar);
+
+    *namelist = list;
+    return count;
+}
+
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
 
 #define SEPARATOR '\x01'
 #define CHUNK_SIZE 16384

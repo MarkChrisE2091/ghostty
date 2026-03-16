@@ -32,7 +32,7 @@ pub const Entry = struct {
 
 /// Get the passwd entry for the currently executing user.
 pub fn get(alloc: Allocator) !Entry {
-    if (builtin.os.tag == .windows) @compileError("passwd is not available on windows");
+    if (builtin.os.tag == .windows) return getWindows(alloc);
 
     var buf: [1024]u8 = undefined;
     var pw: c.struct_passwd = undefined;
@@ -138,6 +138,89 @@ pub fn get(alloc: Allocator) !Entry {
         const source = std.mem.sliceTo(ptr, 0);
         const value = try alloc.dupeZ(u8, source);
         result.name = value;
+    }
+
+    return result;
+}
+
+/// Windows implementation of passwd entry lookup.
+/// Uses environment variables and the COMSPEC to determine the default shell.
+fn getWindows(alloc: Allocator) !Entry {
+    var result: Entry = .{};
+
+    // Try to find PowerShell first since it provides a better experience.
+    // Check for pwsh (PowerShell 7+) then fall back to Windows PowerShell,
+    // and finally COMSPEC (cmd.exe) as last resort.
+    const shell_value = blk: {
+        // Check for PowerShell 7+ (pwsh.exe) via common install paths
+        const pwsh_path = std.process.getEnvVarOwned(alloc, "ProgramFiles") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        if (pwsh_path) |pf| {
+            defer alloc.free(pf);
+            const pwsh = std.fmt.allocPrint(alloc, "{s}\\PowerShell\\7\\pwsh.exe", .{pf}) catch break :blk @as(?[]const u8, null);
+            // Check if the file exists by trying to access it
+            const file = std.fs.openFileAbsolute(pwsh, .{}) catch {
+                alloc.free(pwsh);
+                break :blk @as(?[]const u8, null);
+            };
+            file.close();
+            break :blk @as(?[]const u8, pwsh);
+        }
+        break :blk @as(?[]const u8, null);
+    } orelse blk: {
+        // Fall back to Windows PowerShell (ships with Windows 10+)
+        const sys_root = std.process.getEnvVarOwned(alloc, "SystemRoot") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        if (sys_root) |sr| {
+            defer alloc.free(sr);
+            const ps_path = std.fmt.allocPrint(alloc, "{s}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", .{sr}) catch break :blk @as(?[]const u8, null);
+            const file = std.fs.openFileAbsolute(ps_path, .{}) catch {
+                alloc.free(ps_path);
+                break :blk @as(?[]const u8, null);
+            };
+            file.close();
+            break :blk @as(?[]const u8, ps_path);
+        }
+        break :blk @as(?[]const u8, null);
+    } orelse blk: {
+        // Last resort: COMSPEC (cmd.exe)
+        const comspec = std.process.getEnvVarOwned(alloc, "COMSPEC") catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        break :blk comspec;
+    };
+    if (shell_value) |v| {
+        result.shell = @as([:0]const u8, try alloc.dupeZ(u8, v));
+        alloc.free(v);
+    } else {
+        result.shell = try alloc.dupeZ(u8, "cmd.exe");
+    }
+
+    // Get user home directory from USERPROFILE
+    const home_value = std.process.getEnvVarOwned(alloc, "USERPROFILE") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    if (home_value) |v| {
+        result.home = @as([:0]const u8, try alloc.dupeZ(u8, v));
+        alloc.free(v);
+    }
+
+    // Get username from USERNAME env var
+    const name_value = std.process.getEnvVarOwned(alloc, "USERNAME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    if (name_value) |v| {
+        result.name = @as([:0]const u8, try alloc.dupeZ(u8, v));
+        alloc.free(v);
     }
 
     return result;

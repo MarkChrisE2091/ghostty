@@ -95,7 +95,7 @@ pub fn draw1CD00_1CDE5(
     // that this is static data that is embedded in the binary.
     const octants_len = octant_max - octant_min + 1;
     const octants: [octants_len]Octant = comptime octants: {
-        @setEvalBranchQuota(10_000);
+        @setEvalBranchQuota(100_000); // increased: trimRight adds branches on CRLF files
 
         var result: [octants_len]Octant = @splat(.{});
         var i: usize = 0;
@@ -113,7 +113,10 @@ pub fn draw1CD00_1CDE5(
             // at the end are keys into our packed struct. Since we're
             // at comptime we can metaprogram it all.
             const idx = std.mem.indexOfScalar(u8, line, '-').?;
-            for (line[idx + 1 ..]) |c| @field(current, &.{c}) = true;
+            // Trim trailing CR so CRLF line endings on Windows don't cause
+            // @field to look up a "\r" field that doesn't exist.
+            const octant_chars = std.mem.trimRight(u8, line[idx + 1 ..], "\r");
+            for (octant_chars) |c| @field(current, &.{c}) = true;
         }
 
         assert(i == octants_len);

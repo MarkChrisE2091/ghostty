@@ -544,6 +544,14 @@ pub fn add(
         switch (self.config.app_runtime) {
             .none => {},
             .gtk => try self.addGtkNg(step),
+            .windows => {
+                // Win32 runtime links against system libraries directly
+                step.linkSystemLibrary2("opengl32", dynamic_link_opts);
+                step.linkSystemLibrary2("gdi32", dynamic_link_opts);
+                step.linkSystemLibrary2("user32", dynamic_link_opts);
+                step.linkSystemLibrary2("shell32", dynamic_link_opts);
+                step.linkSystemLibrary2("kernel32", dynamic_link_opts);
+            },
         }
     }
 

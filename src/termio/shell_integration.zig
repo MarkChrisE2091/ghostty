@@ -16,6 +16,7 @@ pub const Shell = enum {
     fish,
     nushell,
     zsh,
+    powershell,
 };
 
 /// The result of setting up a shell integration.
@@ -75,6 +76,16 @@ pub fn setup(
         .elvish, .fish => xdg: {
             if (!try setupXdgDataDirs(alloc_arena, resource_dir, env)) return null;
             break :xdg try command.clone(alloc_arena);
+        },
+
+        .powershell => ps: {
+            // For PowerShell, we set an env var pointing to the integration script.
+            // The user or auto-injection will source it from $PROFILE or command line.
+            const integration_dir = try std.fs.path.join(alloc_arena, &.{
+                resource_dir, "shell-integration", "powershell",
+            });
+            try env.put("GHOSTTY_POWERSHELL_INTEGRATION_DIR", integration_dir);
+            break :ps try command.clone(alloc_arena);
         },
     } orelse return null;
 
@@ -161,6 +172,12 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     if (std.mem.eql(u8, "fish", exe)) return .fish;
     if (std.mem.eql(u8, "nu", exe)) return .nushell;
     if (std.mem.eql(u8, "zsh", exe)) return .zsh;
+
+    // PowerShell detection: pwsh (cross-platform) or powershell (Windows)
+    if (std.mem.eql(u8, "pwsh", exe) or
+        std.mem.eql(u8, "pwsh.exe", exe) or
+        std.mem.eql(u8, "powershell", exe) or
+        std.mem.eql(u8, "powershell.exe", exe)) return .powershell;
 
     return null;
 }

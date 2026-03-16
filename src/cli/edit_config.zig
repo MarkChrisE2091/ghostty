@@ -76,18 +76,19 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
     const path = try configpkg.preferredDefaultFilePath(alloc);
     defer alloc.free(path);
 
-    // We don't currently support Windows because we use the exec syscall.
+    // On Windows, we use the default editor association to open the config.
     if (comptime builtin.os.tag == .windows) {
-        try stderr.print(
-            \\The `ghostty +edit-config` command is not supported on Windows.
-            \\Please edit the configuration file manually at the following path:
-            \\
-            \\{s}
-            \\
-        ,
-            .{path},
-        );
-        return 1;
+        // Try to open with the associated editor via the OS
+        internal_os.open(alloc, .text, path) catch |err| {
+            try stderr.print(
+                "Failed to open config file: {}\n" ++
+                    "Please edit the configuration file manually at:\n\n" ++
+                    "{s}\n",
+                .{ err, path },
+            );
+            return 1;
+        };
+        return 0;
     }
 
     // Get our editor
@@ -140,7 +141,8 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
     // and not have to build that ourselves. We can remove this
     // limitation later but Ghostty already heavily requires libc
     // so this is not a big deal.
-    comptime assert(builtin.link_libc);
+    // This code path is only reached on non-Windows (Windows returns early above).
+    comptime if (builtin.os.tag != .windows) assert(builtin.link_libc);
 
     const editorZ = try alloc.dupeZ(u8, editor);
     defer alloc.free(editorZ);
