@@ -1,8 +1,9 @@
 /// Win32 API bindings and window management for the Windows app runtime.
 ///
 /// This module wraps all Win32 API calls used by Ghostty's Windows backend.
-/// The WndProc here is the central event dispatcher; it translates Win32
-/// messages into Ghostty's platform-independent callbacks.
+/// Two WndProcs dispatch messages:
+///   - windowWndProc: for top-level Window HWNDs (tab bar, frame)
+///   - surfaceWndProc: for child Surface HWNDs (terminal rendering, input)
 const std = @import("std");
 const w = std.os.windows;
 const input = @import("../../input.zig");
@@ -41,6 +42,7 @@ pub const WM_SETFOCUS = 0x0007;
 pub const WM_KILLFOCUS = 0x0008;
 pub const WM_CLOSE = 0x0010;
 pub const WM_PAINT = 0x000F;
+pub const WM_ERASEBKGND = 0x0014;
 pub const WM_QUIT = 0x0012;
 pub const WM_GETMINMAXINFO = 0x0024;
 pub const WM_SETCURSOR = 0x0020;
@@ -76,17 +78,10 @@ pub const WM_MOUSELEAVE = 0x02A3;
 pub const WM_DPICHANGED = 0x02E0;
 pub const WM_USER = 0x0400;
 
-// SC_CLOSE for WM_SYSCOMMAND
 pub const SC_CLOSE = 0xF060;
-
-// XBUTTON identifiers
 pub const XBUTTON1: u16 = 0x0001;
 pub const XBUTTON2: u16 = 0x0002;
-
-// Mouse tracking
 pub const TME_LEAVE: DWORD = 0x00000002;
-
-// WHEEL_DELTA
 pub const WHEEL_DELTA: i16 = 120;
 
 // ---------------------------------------------------------------------------
@@ -102,14 +97,26 @@ pub const WS_MINIMIZE: u32 = 0x20000000;
 pub const WS_CLIPCHILDREN: u32 = 0x02000000;
 pub const WS_CLIPSIBLINGS: u32 = 0x04000000;
 pub const WS_SYSMENU: u32 = 0x00080000;
+pub const WS_CHILD: u32 = 0x40000000;
 pub const CS_OWNDC: u32 = 0x0020;
 pub const CS_HREDRAW: u32 = 0x0002;
 pub const CS_VREDRAW: u32 = 0x0001;
 pub const CS_DBLCLKS: u32 = 0x0008;
 
+// Edit control styles
+pub const ES_AUTOHSCROLL: u32 = 0x0080;
+pub const WS_BORDER: u32 = 0x00800000;
+pub const WS_TABSTOP: u32 = 0x00010000;
+pub const WM_COMMAND: UINT = 0x0111;
+pub const WM_GETTEXT: UINT = 0x000D;
+pub const WM_GETTEXTLENGTH: UINT = 0x000E;
+pub const WM_SETTEXT: UINT = 0x000C;
+pub const EN_CHANGE: u16 = 0x0300;
+
 // Extended styles
 pub const WS_EX_LAYERED: u32 = 0x00080000;
 pub const WS_EX_TOPMOST: u32 = 0x00000008;
+pub const WS_EX_CLIENTEDGE: u32 = 0x00000200;
 
 // ---------------------------------------------------------------------------
 // SetWindowPos / ShowWindow flags
@@ -137,10 +144,12 @@ pub const PM_REMOVE: UINT = 0x0001;
 pub const PM_NOREMOVE: UINT = 0x0000;
 
 // ---------------------------------------------------------------------------
-// MessageBeep
+// MessageBeep / MessageBox
 // ---------------------------------------------------------------------------
 pub const MB_OK: UINT = 0x00000000;
+pub const MB_OKCANCEL: UINT = 0x00000001;
 pub const MB_ICONINFORMATION: UINT = 0x00000040;
+pub const MB_ICONWARNING: UINT = 0x00000030;
 
 // ---------------------------------------------------------------------------
 // GetWindowLong indices
@@ -171,6 +180,12 @@ pub const MONITOR_DEFAULTTOPRIMARY: DWORD = 1;
 pub const CF_UNICODETEXT: UINT = 13;
 pub const CF_TEXT: UINT = 1;
 pub const GMEM_MOVEABLE: UINT = 0x0002;
+
+// ---------------------------------------------------------------------------
+// Layered window
+// ---------------------------------------------------------------------------
+pub const LWA_COLORKEY: DWORD = 0x00000001;
+pub const LWA_ALPHA: DWORD = 0x00000002;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -283,7 +298,11 @@ pub const PAINTSTRUCT = extern struct {
 
 pub const WNDPROC = *const fn (HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 
-const CLASS_NAME = "GhosttyWindowClass";
+// ---------------------------------------------------------------------------
+// Window class names
+// ---------------------------------------------------------------------------
+const WINDOW_CLASS_NAME = "GhosttyWindow";
+const SURFACE_CLASS_NAME = "GhosttySurface";
 
 // ---------------------------------------------------------------------------
 // Raw Win32 extern declarations
@@ -330,13 +349,17 @@ extern "user32" fn PostThreadMessageA(DWORD, UINT, WPARAM, LPARAM) callconv(.win
 extern "user32" fn GetDpiForWindow(HWND) callconv(.winapi) UINT;
 extern "user32" fn TrackMouseEvent(*TRACKMOUSEEVENT) callconv(.winapi) BOOL;
 extern "user32" fn MessageBoxW(?HWND, [*:0]const u16, [*:0]const u16, UINT) callconv(.winapi) i32;
-
-// Layered window
-pub const LWA_COLORKEY: DWORD = 0x00000001;
-pub const LWA_ALPHA: DWORD = 0x00000002;
 extern "user32" fn SetLayeredWindowAttributes(HWND, DWORD, u8, DWORD) callconv(.winapi) BOOL;
 extern "user32" fn FlashWindow(HWND, BOOL) callconv(.winapi) BOOL;
 extern "user32" fn GetWindowTextA(HWND, [*]u8, i32) callconv(.winapi) i32;
+const SetFocusFn = *const fn (HWND) callconv(.winapi) ?HWND;
+const pSetFocus: SetFocusFn = @extern(SetFocusFn, .{ .name = "SetFocus", .library_name = "user32" });
+extern "user32" fn SendMessageA(HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+extern "user32" fn MoveWindow(HWND, i32, i32, i32, i32, BOOL) callconv(.winapi) BOOL;
+extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
+extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+extern "user32" fn FillRect(HDC, *const RECT, ?HBRUSH) callconv(.winapi) i32;
+extern "user32" fn DrawTextA(HDC, [*]const u8, i32, *RECT, UINT) callconv(.winapi) i32;
 
 // Clipboard
 extern "user32" fn OpenClipboard(?HWND) callconv(.winapi) BOOL;
@@ -354,30 +377,91 @@ extern "kernel32" fn GlobalSize(?HGLOBAL) callconv(.winapi) usize;
 extern "gdi32" fn ChoosePixelFormat(HDC, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) i32;
 extern "gdi32" fn SetPixelFormat(HDC, i32, *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
 extern "gdi32" fn SwapBuffers(HDC) callconv(.winapi) BOOL;
+extern "gdi32" fn CreateSolidBrush(DWORD) callconv(.winapi) ?HBRUSH;
+extern "gdi32" fn DeleteObject(?*anyopaque) callconv(.winapi) BOOL;
+extern "gdi32" fn SelectObject(HDC, ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn SetTextColor(HDC, DWORD) callconv(.winapi) DWORD;
+extern "gdi32" fn SetBkMode(HDC, i32) callconv(.winapi) i32;
+extern "gdi32" fn GetStockObject(i32) callconv(.winapi) ?*anyopaque;
 
 // Shell
 extern "shell32" fn ShellExecuteW(?HWND, ?[*:0]const u16, [*:0]const u16, ?[*:0]const u16, ?[*:0]const u16, i32) callconv(.winapi) isize;
 
 // ---------------------------------------------------------------------------
+// GDI helpers (namespaced to avoid collisions)
+// ---------------------------------------------------------------------------
+pub const gdi = struct {
+    pub const DT_SINGLELINE: UINT = 0x0020;
+    pub const DT_CENTER: UINT = 0x0001;
+    pub const DT_VCENTER: UINT = 0x0004;
+    pub const DT_END_ELLIPSIS: UINT = 0x8000;
+    pub const DT_NOPREFIX: UINT = 0x0800;
+    pub const TRANSPARENT: i32 = 1;
+    pub const DEFAULT_GUI_FONT: i32 = 17;
+
+    pub fn fillRect(hdc: HDC, rect: *const RECT, color: u32) void {
+        const brush = CreateSolidBrush(color);
+        _ = FillRect(hdc, rect, brush);
+        if (brush) |b| _ = DeleteObject(b);
+    }
+
+    pub fn drawText(hdc: HDC, text: []const u8, rect: *RECT, flags: UINT) void {
+        _ = DrawTextA(hdc, text.ptr, @intCast(text.len), rect, flags);
+    }
+
+    pub fn getStockObject(i: i32) ?*anyopaque {
+        return GetStockObject(i);
+    }
+
+    pub fn selectObject(hdc: HDC, obj: ?*anyopaque) ?*anyopaque {
+        return SelectObject(hdc, obj);
+    }
+
+    pub fn setTextColor(hdc: HDC, color: u32) u32 {
+        return SetTextColor(hdc, color);
+    }
+
+    pub fn setBkMode(hdc: HDC, mode: i32) i32 {
+        return SetBkMode(hdc, mode);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Zig wrappers
 // ---------------------------------------------------------------------------
 
+/// Register the top-level Window class.
 pub fn registerWindowClass(hinstance: w.HINSTANCE) !void {
     const wc: WNDCLASSEXA = .{
-        .style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-        .lpfnWndProc = wndProc,
+        .style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+        .lpfnWndProc = windowWndProc,
         .hInstance = hinstance,
-        .hCursor = LoadCursorA(null, @ptrFromInt(32512)), // IDC_ARROW
+        .hCursor = LoadCursorA(null, @ptrFromInt(32512)),
         .hbrBackground = null,
-        .lpszClassName = CLASS_NAME,
+        .lpszClassName = WINDOW_CLASS_NAME,
     };
-
     if (RegisterClassExA(&wc) == 0) {
         return error.RegisterClassFailed;
     }
 }
 
-pub fn createWindow(
+/// Register the child Surface class (CS_OWNDC for OpenGL).
+pub fn registerSurfaceClass(hinstance: w.HINSTANCE) !void {
+    const wc: WNDCLASSEXA = .{
+        .style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+        .lpfnWndProc = surfaceWndProc,
+        .hInstance = hinstance,
+        .hCursor = LoadCursorA(null, @ptrFromInt(32512)),
+        .hbrBackground = null,
+        .lpszClassName = SURFACE_CLASS_NAME,
+    };
+    if (RegisterClassExA(&wc) == 0) {
+        return error.RegisterClassFailed;
+    }
+}
+
+/// Create a top-level Window HWND.
+pub fn createMainWindow(
     hinstance: w.HINSTANCE,
     title: [*:0]const u8,
     width: u32,
@@ -388,7 +472,7 @@ pub fn createWindow(
     const cw_usedefault: i32 = @bitCast(@as(u32, 0x80000000));
     const hwnd = CreateWindowExA(
         0,
-        CLASS_NAME,
+        WINDOW_CLASS_NAME,
         title,
         style,
         cw_usedefault,
@@ -403,6 +487,82 @@ pub fn createWindow(
 
     _ = SetWindowLongPtrA(hwnd, GWLP_USERDATA, @intCast(userdata));
     return hwnd;
+}
+
+/// Create a child Surface HWND (for terminal rendering).
+pub fn createChildWindow(
+    hinstance: w.HINSTANCE,
+    parent: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    userdata: usize,
+) !HWND {
+    const style: DWORD = WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+    const hwnd = CreateWindowExA(
+        0,
+        SURFACE_CLASS_NAME,
+        "",
+        style,
+        x,
+        y,
+        width,
+        height,
+        parent,
+        null,
+        hinstance,
+        null,
+    ) orelse return error.CreateWindowFailed;
+
+    _ = SetWindowLongPtrA(hwnd, GWLP_USERDATA, @intCast(userdata));
+    return hwnd;
+}
+
+/// Create a standard Win32 control (EDIT, STATIC, BUTTON, etc.).
+pub fn createControl(
+    class_name: [*:0]const u8,
+    text: [*:0]const u8,
+    style: DWORD,
+    ex_style: DWORD,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    parent: HWND,
+    hinstance: w.HINSTANCE,
+) ?HWND {
+    return CreateWindowExA(
+        ex_style,
+        class_name,
+        text,
+        style,
+        x,
+        y,
+        width,
+        height,
+        parent,
+        null,
+        hinstance,
+        null,
+    );
+}
+
+pub fn sendMessage(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) LRESULT {
+    return SendMessageA(hwnd, msg, wparam, lparam);
+}
+
+pub fn getWindowTextLength(hwnd: HWND) i32 {
+    return @intCast(SendMessageA(hwnd, WM_GETTEXTLENGTH, 0, 0));
+}
+
+pub fn getEditText(hwnd: HWND, buf: []u8) []const u8 {
+    const len = SendMessageA(hwnd, WM_GETTEXT, @intCast(buf.len), @intCast(@intFromPtr(buf.ptr)));
+    return buf[0..@intCast(len)];
+}
+
+pub fn setEditText(hwnd: HWND, text: [*:0]const u8) void {
+    _ = SetWindowTextA(hwnd, text);
 }
 
 pub fn destroyWindow(hwnd: HWND) void {
@@ -442,10 +602,8 @@ pub fn releaseDC(hwnd: HWND, hdc: HDC) void {
 }
 
 pub fn setWindowTitle(hwnd: HWND, title: []const u8) void {
-    // Convert UTF-8 title to UTF-16 for SetWindowTextW
     var buf: [512]u16 = undefined;
     const len = std.unicode.utf8ToUtf16Le(&buf, title) catch {
-        // Fallback to ANSI if conversion fails
         var abuf: [256:0]u8 = undefined;
         const alen = @min(title.len, abuf.len - 1);
         @memcpy(abuf[0..alen], title[0..alen]);
@@ -557,9 +715,7 @@ pub fn messageBoxW(hwnd: ?HWND, text: [*:0]const u16, caption: [*:0]const u16, t
     return MessageBoxW(hwnd, text, caption, typ);
 }
 
-/// SetWindowPos variant that accepts an isize insert_after (for HWND_TOPMOST etc.)
 pub fn setWindowPosZ(hwnd: HWND, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: UINT) void {
-    // Cast isize to ?HWND — works because Win32 HWND_TOPMOST = -1 etc. are sentinel values
     _ = SetWindowPos(hwnd, @ptrFromInt(@as(usize, @bitCast(insert_after))), x, y, cx, cy, flags);
 }
 
@@ -575,9 +731,15 @@ pub fn getWindowTextA(hwnd: HWND, buf: [*]u8, max_count: i32) i32 {
     return GetWindowTextA(hwnd, buf, max_count);
 }
 
-/// Open a URL or file with the default application (equivalent to xdg-open / macOS open).
+pub fn setFocus(hwnd: HWND) void {
+    _ = pSetFocus(hwnd);
+}
+
+pub fn moveWindow(hwnd: HWND, x: i32, y: i32, cx: i32, cy: i32, repaint: bool) void {
+    _ = MoveWindow(hwnd, x, y, cx, cy, if (repaint) 1 else 0);
+}
+
 pub fn shellOpen(hwnd: ?HWND, url: []const u8) void {
-    // Convert UTF-8 URL to wide string
     var buf: [2048]u16 = undefined;
     const len = std.unicode.utf8ToUtf16Le(&buf, url) catch return;
     if (len >= buf.len) return;
@@ -585,8 +747,6 @@ pub fn shellOpen(hwnd: ?HWND, url: []const u8) void {
     _ = ShellExecuteW(hwnd, null, @as([*:0]const u16, @ptrCast(&buf)), null, null, SW_SHOWNORMAL);
 }
 
-/// Read the clipboard as UTF-8. Caller owns the returned slice (allocated with alloc).
-/// Returns null if the clipboard is empty or doesn't contain text.
 pub fn clipboardReadText(hwnd: ?HWND, alloc: std.mem.Allocator) ?[]u8 {
     if (OpenClipboard(hwnd) == 0) return null;
     defer _ = CloseClipboard();
@@ -598,11 +758,8 @@ pub fn clipboardReadText(hwnd: ?HWND, alloc: std.mem.Allocator) ?[]u8 {
     const size_bytes = GlobalSize(hdata);
     if (size_bytes < 2) return null;
 
-    // Treat as null-terminated UTF-16LE
     const wide_ptr: [*]const u16 = @alignCast(@ptrCast(ptr));
     const max_chars = size_bytes / 2;
-
-    // Find the null terminator
     var len: usize = 0;
     while (len < max_chars and wide_ptr[len] != 0) len += 1;
 
@@ -611,22 +768,20 @@ pub fn clipboardReadText(hwnd: ?HWND, alloc: std.mem.Allocator) ?[]u8 {
     return utf8;
 }
 
-/// Write text to the clipboard as UTF-16 (standard Windows clipboard format).
 pub fn clipboardWriteText(hwnd: ?HWND, text: []const u8) bool {
-    // Convert to UTF-16
     const alloc = std.heap.page_allocator;
     const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, text) catch return false;
     defer alloc.free(wide);
 
-    const size = (wide.len + 1) * 2; // include null terminator
+    const size = (wide.len + 1) * 2;
     const hmem = GlobalAlloc(GMEM_MOVEABLE, size) orelse return false;
 
-    const ptr = GlobalLock(hmem) orelse {
+    const mem_ptr = GlobalLock(hmem) orelse {
         _ = GlobalFree(hmem);
         return false;
     };
 
-    const dst: [*]u16 = @alignCast(@ptrCast(ptr));
+    const dst: [*]u16 = @alignCast(@ptrCast(mem_ptr));
     @memcpy(dst[0..wide.len], wide);
     dst[wide.len] = 0;
     _ = GlobalUnlock(hmem);
@@ -639,7 +794,6 @@ pub fn clipboardWriteText(hwnd: ?HWND, text: []const u8) bool {
     const result = SetClipboardData(CF_UNICODETEXT, hmem);
     _ = CloseClipboard();
 
-    // If SetClipboardData failed, free the memory ourselves
     if (result == null) {
         _ = GlobalFree(hmem);
         return false;
@@ -649,75 +803,57 @@ pub fn clipboardWriteText(hwnd: ?HWND, text: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Window procedure (central event dispatcher)
+// Window WndProc (top-level frame window)
 // ---------------------------------------------------------------------------
 
-fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
-    const Surface = @import("Surface.zig");
+fn windowWndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+    const Window = @import("Window.zig");
 
-    // Retrieve the Surface pointer stored in GWLP_USERDATA
-    const surface_ptr = GetWindowLongPtrA(hwnd, GWLP_USERDATA);
-    const surface: ?*Surface = if (surface_ptr != 0)
-        @ptrFromInt(@as(usize, @intCast(surface_ptr)))
+    const win_ptr = GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    const window: ?*Window = if (win_ptr != 0)
+        @ptrFromInt(@as(usize, @intCast(win_ptr)))
     else
         null;
 
     switch (msg) {
-        // ------------------------------------------------------------------
-        // Window lifecycle
-        // ------------------------------------------------------------------
         WM_CLOSE => {
-            if (surface) |s| s.onClose();
+            if (window) |win| win.onClose();
             return 0;
         },
 
-        WM_DESTROY => {
-            // Only post WM_QUIT if this was the last window. The App tracks
-            // surface count; if we're down to zero it posts WM_QUIT itself.
+        WM_DESTROY => return 0,
+
+        WM_SIZE => {
+            const width: u32 = @intCast(lparam & 0xFFFF);
+            const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
+            if (window) |win| win.onSize(width, height);
             return 0;
         },
 
-        // ------------------------------------------------------------------
-        // Painting / rendering
-        // ------------------------------------------------------------------
         WM_PAINT => {
             var ps: PAINTSTRUCT = .{};
             const paint_hdc = BeginPaint(hwnd, &ps);
-            _ = paint_hdc;
-            if (surface) |s| s.onPaint();
+            if (window) |win| {
+                if (paint_hdc) |hdc| win.paintTabBar(hdc);
+            }
             _ = EndPaint(hwnd, &ps);
             return 0;
         },
 
-        // ------------------------------------------------------------------
-        // Resize
-        // ------------------------------------------------------------------
-        WM_SIZE => {
-            const width: u32 = @intCast(lparam & 0xFFFF);
-            const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
-            if (surface) |s| s.onResize(width, height);
-            return 0;
-        },
+        WM_ERASEBKGND => return 1,
 
-        // ------------------------------------------------------------------
-        // Size constraints
-        // ------------------------------------------------------------------
         WM_GETMINMAXINFO => {
-            if (surface) |s| {
+            if (window) |win| {
                 const mmi: *MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
-                s.onMinMaxInfo(mmi);
+                win.onMinMaxInfo(mmi);
             }
             return 0;
         },
 
-        // ------------------------------------------------------------------
-        // DPI change
-        // ------------------------------------------------------------------
         WM_DPICHANGED => {
             const new_dpi: u32 = @intCast(wparam & 0xFFFF);
-            if (surface) |s| {
-                s.onDpiChange(new_dpi);
-                // Auto-resize window to the suggested rect
+            if (window) |win| {
+                win.onDpiChange(new_dpi);
                 const suggested: *const RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
                 _ = SetWindowPos(
                     hwnd,
@@ -732,9 +868,63 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
 
-        // ------------------------------------------------------------------
-        // Focus
-        // ------------------------------------------------------------------
+        WM_SETFOCUS => {
+            if (window) |win| win.onFocusIn();
+            return 0;
+        },
+
+        WM_LBUTTONDOWN => {
+            if (window) |win| {
+                const y_raw: u16 = @intCast((lparam >> 16) & 0xFFFF);
+                const y: i32 = @intCast(y_raw);
+                if (y >= 0 and @as(u32, @intCast(y)) < win.getTabBarHeight()) {
+                    const x_raw: u16 = @intCast(lparam & 0xFFFF);
+                    const x: i32 = @intCast(x_raw);
+                    win.onTabBarClick(x, y);
+                    return 0;
+                }
+            }
+            return DefWindowProcA(hwnd, msg, wparam, lparam);
+        },
+
+        WM_USER => return 0,
+
+        else => return DefWindowProcA(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface WndProc (child terminal window)
+// ---------------------------------------------------------------------------
+
+fn surfaceWndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+    const Surface = @import("Surface.zig");
+
+    const surface_ptr = GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    const surface: ?*Surface = if (surface_ptr != 0)
+        @ptrFromInt(@as(usize, @intCast(surface_ptr)))
+    else
+        null;
+
+    switch (msg) {
+        WM_PAINT => {
+            var ps: PAINTSTRUCT = .{};
+            const paint_hdc = BeginPaint(hwnd, &ps);
+            _ = paint_hdc;
+            if (surface) |s| s.onPaint();
+            _ = EndPaint(hwnd, &ps);
+            return 0;
+        },
+
+        WM_ERASEBKGND => return 1,
+
+        WM_SIZE => {
+            const width: u32 = @intCast(lparam & 0xFFFF);
+            const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
+            if (surface) |s| s.onResize(width, height);
+            return 0;
+        },
+
         WM_SETFOCUS => {
             if (surface) |s| s.onFocusChange(true);
             return DefWindowProcA(hwnd, msg, wparam, lparam);
@@ -745,18 +935,14 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return DefWindowProcA(hwnd, msg, wparam, lparam);
         },
 
-        // ------------------------------------------------------------------
         // Keyboard
-        // ------------------------------------------------------------------
         WM_KEYDOWN, WM_SYSKEYDOWN => {
             if (surface) |s| {
                 const vk: u16 = @intCast(wparam & 0xFFFF);
                 const scan: u32 = @intCast((lparam >> 16) & 0xFF);
-                // Bit 30 of lParam: key was already down (auto-repeat)
                 const is_repeat = (lparam >> 30) & 1 != 0;
                 s.onKey(vk, scan, if (is_repeat) .repeat else .press);
             }
-            // Let DefWindowProc handle Alt+F4 (WM_SYSCOMMAND) and other system shortcuts
             if (msg == WM_SYSKEYDOWN) return DefWindowProcA(hwnd, msg, wparam, lparam);
             return 0;
         },
@@ -771,14 +957,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
 
-        // WM_CHAR carries the UTF-16 character for the key event.
-        // Text is already captured via ToUnicode in WM_KEYDOWN, so we
-        // suppress WM_CHAR to avoid duplicate character input.
-        // TODO: For proper IME support, handle WM_IME_COMPOSITION instead.
         WM_CHAR, WM_SYSCHAR => return 0,
 
         WM_UNICHAR => {
-            if (wparam == 0xFFFF) return 1; // UNICODE_NOCHAR: tell Windows we support WM_UNICHAR
+            if (wparam == 0xFFFF) return 1;
             if (surface) |s| {
                 const cp: u21 = @intCast(wparam);
                 s.onUnichar(cp);
@@ -786,14 +968,11 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
 
-        // ------------------------------------------------------------------
         // Mouse movement
-        // ------------------------------------------------------------------
         WM_MOUSEMOVE => {
             const x: i16 = @bitCast(@as(u16, @intCast(lparam & 0xFFFF)));
             const y: i16 = @bitCast(@as(u16, @intCast((lparam >> 16) & 0xFFFF)));
             if (surface) |s| {
-                // Request WM_MOUSELEAVE tracking
                 if (!s.tracking_mouse_leave) {
                     var tme = TRACKMOUSEEVENT{
                         .dwFlags = TME_LEAVE,
@@ -810,25 +989,22 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         WM_MOUSELEAVE => {
             if (surface) |s| {
                 s.tracking_mouse_leave = false;
-                // Send a negative position to indicate "mouse left"
                 s.onMouseMove(-1.0, -1.0);
             }
             return 0;
         },
 
-        // ------------------------------------------------------------------
         // Mouse buttons
-        // ------------------------------------------------------------------
         WM_LBUTTONDOWN, WM_LBUTTONDBLCLK => {
             if (surface) |s| {
-                setCapture(hwnd);
+                _ = SetCapture(hwnd);
                 s.onMouseButton(.press, .left);
             }
             return 0;
         },
         WM_LBUTTONUP => {
             if (surface) |s| {
-                releaseCapture();
+                _ = ReleaseCapture();
                 s.onMouseButton(.release, .left);
             }
             return 0;
@@ -855,7 +1031,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 const btn: input.MouseButton = if (xbutton == XBUTTON1) .four else .five;
                 s.onMouseButton(.press, btn);
             }
-            return 1; // XBUTTON handlers should return TRUE
+            return 1;
         },
         WM_XBUTTONUP => {
             const xbutton: u16 = @intCast((wparam >> 16) & 0xFFFF);
@@ -866,9 +1042,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 1;
         },
 
-        // ------------------------------------------------------------------
         // Mouse scroll
-        // ------------------------------------------------------------------
         WM_MOUSEWHEEL => {
             const delta: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
             if (surface) |s| {
@@ -881,43 +1055,34 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         WM_MOUSEHWHEEL => {
             const delta: i16 = @bitCast(@as(u16, @intCast((wparam >> 16) & 0xFFFF)));
             if (surface) |s| {
-                // Horizontal scroll: positive = right, so negate for xoff convention
                 const xoff: f64 = @as(f64, @floatFromInt(delta)) / @as(f64, WHEEL_DELTA);
                 s.onScroll(xoff, 0.0);
             }
             return 0;
         },
 
-        // ------------------------------------------------------------------
-        // Cursor shape (set by default handler initially)
-        // ------------------------------------------------------------------
+        // Cursor shape
         WM_SETCURSOR => {
             if (surface) |s| {
                 if (s.cursor_handle) |h| {
                     _ = SetCursor(h);
-                    return 1; // handled
+                    return 1;
                 }
             }
             return DefWindowProcA(hwnd, msg, wparam, lparam);
         },
 
-        // ------------------------------------------------------------------
-        // User-defined wakeup
-        // ------------------------------------------------------------------
-        WM_USER => return 0,
+        // Edit control notifications (search bar)
+        WM_COMMAND => {
+            const notification: u16 = @intCast((wparam >> 16) & 0xFFFF);
+            if (notification == EN_CHANGE) {
+                if (surface) |s| {
+                    s.onSearchTextChanged();
+                }
+            }
+            return 0;
+        },
 
         else => return DefWindowProcA(hwnd, msg, wparam, lparam),
     }
-}
-
-// SetCapture / ReleaseCapture for mouse button tracking
-extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
-extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
-
-fn setCapture(hwnd: HWND) void {
-    _ = SetCapture(hwnd);
-}
-
-fn releaseCapture() void {
-    _ = ReleaseCapture();
 }

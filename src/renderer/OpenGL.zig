@@ -212,20 +212,12 @@ pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
 
 /// Callback called by renderer.Thread when it begins.
 /// HDC stored by the renderer thread for SwapBuffers in drawFrameEnd.
-/// This is set in threadEnter and used in drawFrameEnd. Only the
-/// renderer thread accesses this, so no synchronization is needed.
-var win32_thread_hdc: ?*anyopaque = null;
+/// Each renderer thread has its own copy via threadlocal.
+threadlocal var win32_thread_hdc: ?*anyopaque = null;
 
-/// Pending window size set by the main thread (WM_SIZE), read by
-/// the renderer thread in drawFrameStart to update glViewport.
-/// Packed as (width << 32 | height), or 0 if no pending resize.
-var win32_pending_size: std.atomic.Value(u64) = .init(0);
-
-/// Called from the main thread to notify the renderer of a new size.
-pub fn win32SetPendingSize(width: u32, height: u32) void {
-    const val: u64 = (@as(u64, width) << 32) | @as(u64, height);
-    win32_pending_size.store(val, .release);
-}
+/// Per-thread pointer to the surface's pending_size atomic.
+/// Set in threadEnter, used in drawFrameStart to check for resize.
+threadlocal var win32_pending_size_ptr: ?*std.atomic.Value(u64) = null;
 
 pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
@@ -255,6 +247,8 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
             try prepareContext(null);
             // Store HDC for SwapBuffers in drawFrameEnd
             win32_thread_hdc = surface.hdc;
+            // Store pointer to per-surface pending size atomic
+            win32_pending_size_ptr = &surface.pending_size;
         },
     }
 }
@@ -279,6 +273,7 @@ pub fn threadExit(self: *const OpenGL) void {
             // Unload GLAD for this thread and release the WGL context.
             gl.glad.unload();
             win32_thread_hdc = null;
+            win32_pending_size_ptr = null;
             const wgl = @import("../apprt/windows/wgl.zig");
             wgl.makeCurrent(null, null) catch {};
         },
@@ -314,7 +309,8 @@ pub fn drawFrameStart(self: *OpenGL) void {
         apprt.win32 => {
             // Check if the main thread posted a new window size.
             // If so, update glViewport so the renderer matches the window.
-            const pending = win32_pending_size.swap(0, .acquire);
+            const ps = win32_pending_size_ptr orelse return;
+            const pending = ps.swap(0, .acquire);
             if (pending != 0) {
                 const w: gl.c.GLsizei = @intCast(pending >> 32);
                 const h: gl.c.GLsizei = @intCast(pending & 0xFFFFFFFF);

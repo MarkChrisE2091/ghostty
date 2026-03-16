@@ -1,8 +1,9 @@
 /// Win32 application runtime for Ghostty.
 ///
 /// This implements the apprt interface using native Win32 APIs.
-/// One App drives one Win32 message loop. Each terminal window is
-/// a Surface (see Surface.zig).
+/// One App drives one Win32 message loop. Each top-level window is a
+/// Window (see Window.zig) which hosts one or more terminal Surfaces
+/// as tabs (see Surface.zig).
 const App = @This();
 
 const std = @import("std");
@@ -15,6 +16,7 @@ const input = @import("../../input.zig");
 const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const Surface = @import("Surface.zig");
+const Window = @import("Window.zig");
 const internal_os = @import("../../os/main.zig");
 const renderer = @import("../../renderer.zig");
 const terminal = @import("../../terminal/main.zig");
@@ -28,7 +30,6 @@ const log = std.log.scoped(.win32);
 // Apprt constants queried by CoreApp
 // ---------------------------------------------------------------------------
 
-/// The renderer thread can draw from any thread via WGL.
 pub const must_draw_from_app_thread = false;
 
 // ---------------------------------------------------------------------------
@@ -44,8 +45,8 @@ core_app: *CoreApp,
 /// A copy of the application configuration (owned by us).
 config: Config,
 
-/// All live surfaces.
-surfaces: std.ArrayListUnmanaged(*Surface),
+/// All live windows.
+windows: std.ArrayListUnmanaged(*Window),
 
 /// Allocator for all win32 runtime objects.
 alloc: Allocator,
@@ -69,8 +70,6 @@ pub fn init(
 
     const alloc = core_app.alloc;
 
-    // Load the configuration. On failure, log the error and continue with
-    // a default config so the window can still open.
     var config = configpkg.Config.load(alloc) catch |err| blk: {
         log.warn("failed to load config: {}; using defaults", .{err});
         break :blk try configpkg.Config.default(alloc);
@@ -80,38 +79,41 @@ pub fn init(
     var config_clone = try config.clone(alloc);
     errdefer config_clone.deinit();
 
-    // GetModuleHandleW returns HMODULE; Win32 treats HMODULE == HINSTANCE
-    // at the ABI level but Zig models them as distinct opaques, so cast.
     const hinstance: w.HINSTANCE = @ptrCast(
         w.kernel32.GetModuleHandleW(null) orelse return error.GetModuleHandleFailed,
     );
 
     try win32.registerWindowClass(hinstance);
+    try win32.registerSurfaceClass(hinstance);
 
     self.* = .{
         .hinstance = hinstance,
         .core_app = core_app,
         .config = config_clone,
-        .surfaces = .{},
+        .windows = .{},
         .alloc = alloc,
         .quit_requested = false,
         .quit_timer_id = null,
     };
 
     // Create the first terminal window
-    _ = try self.newSurface();
+    _ = try self.newWindow();
 }
 
 pub fn run(self: *App) !void {
-    // Classic Win32 message loop with WaitMessage so we don't spin.
     var msg: win32.MSG = undefined;
     while (!self.quit_requested) {
-        // Process all pending messages
         while (win32.peekMessage(&msg, null, 0, 0, win32.PM_REMOVE)) {
             if (msg.message == win32.WM_QUIT) {
                 self.quit_requested = true;
                 break;
             }
+
+            // Intercept key messages for search edits before dispatch
+            if (msg.message == win32.WM_KEYDOWN) {
+                if (self.handleSearchKeyIntercept(&msg)) continue;
+            }
+
             win32.translateMessage(&msg);
             win32.dispatchMessage(&msg);
         }
@@ -123,27 +125,24 @@ pub fn run(self: *App) !void {
             log.err("error ticking core app: {}", .{err});
         };
 
-        if (self.surfaces.items.len == 0 and self.quit_timer_id == null) {
+        if (self.windows.items.len == 0 and self.quit_timer_id == null) {
             self.quit_requested = true;
             break;
         }
 
-        // Wait for the next message instead of busy-spinning.
-        // The wakeup() method posts WM_USER to interrupt this wait.
         win32.waitMessage();
     }
 }
 
 pub fn terminate(self: *App) void {
-    for (self.surfaces.items) |surface| {
-        surface.deinit();
-        self.alloc.destroy(surface);
+    for (self.windows.items) |window| {
+        window.deinit();
+        self.alloc.destroy(window);
     }
-    self.surfaces.deinit(self.alloc);
+    self.windows.deinit(self.alloc);
     self.config.deinit();
 }
 
-/// Called by CoreApp to interrupt the WaitMessage() in run().
 pub fn wakeup(self: *App) void {
     _ = self;
     win32.postThreadMessage(
@@ -170,14 +169,13 @@ pub fn performAction(
         },
 
         .close_all_windows => {
-            // Close all surfaces; the message loop will then exit.
-            var i = self.surfaces.items.len;
+            var i = self.windows.items.len;
             while (i > 0) {
                 i -= 1;
-                const s = self.surfaces.items[i];
-                _ = self.surfaces.swapRemove(i);
-                s.deinit();
-                self.alloc.destroy(s);
+                const window = self.windows.items[i];
+                _ = self.windows.swapRemove(i);
+                window.deinit();
+                self.alloc.destroy(window);
             }
             self.quit_requested = true;
             return true;
@@ -186,10 +184,7 @@ pub fn performAction(
         .quit_timer => {
             switch (value) {
                 .start => {
-                    // Set a 100ms WM_TIMER to poll the "no more surfaces" condition.
-                    // In a real implementation, honor the config quit-after-close-delay.
-                    // For now just quit immediately if no surfaces.
-                    if (self.surfaces.items.len == 0) {
+                    if (self.windows.items.len == 0) {
                         self.quit_requested = true;
                     }
                 },
@@ -204,14 +199,64 @@ pub fn performAction(
         // Window creation
         // ------------------------------------------------------------------
         .new_window => {
-            _ = try self.newSurface();
+            _ = try self.newWindow();
             return true;
         },
 
         .close_window => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| {
-                    self.removeSurface(s);
+                if (self.windowForCore(target.surface)) |window| {
+                    self.removeWindow(window);
+                }
+            }
+            return true;
+        },
+
+        // ------------------------------------------------------------------
+        // Tabs
+        // ------------------------------------------------------------------
+        .new_tab => {
+            if (target == .surface) {
+                if (self.windowForCore(target.surface)) |window| {
+                    _ = window.addTab() catch |err| {
+                        log.warn("failed to create new tab: {}", .{err});
+                    };
+                }
+            } else {
+                // App target: add tab to first window or create new window
+                if (self.windows.items.len > 0) {
+                    _ = self.windows.items[0].addTab() catch |err| {
+                        log.warn("failed to create new tab: {}", .{err});
+                    };
+                } else {
+                    _ = try self.newWindow();
+                }
+            }
+            return true;
+        },
+
+        .close_tab => {
+            if (target == .surface) {
+                if (self.windowForCore(target.surface)) |window| {
+                    window.closeTab(value);
+                }
+            }
+            return true;
+        },
+
+        .goto_tab => {
+            if (target == .surface) {
+                if (self.windowForCore(target.surface)) |window| {
+                    window.gotoTab(value);
+                }
+            }
+            return true;
+        },
+
+        .move_tab => {
+            if (target == .surface) {
+                if (self.windowForCore(target.surface)) |window| {
+                    window.moveTab(value.amount);
                 }
             }
             return true;
@@ -229,7 +274,6 @@ pub fn performAction(
             return true;
         },
 
-        // set_tab_title: we don't have tabs, treat same as set_title
         .set_tab_title => {
             if (target == .surface) {
                 if (self.surfaceForCore(target.surface)) |s| {
@@ -246,7 +290,14 @@ pub fn performAction(
             if (target == .surface) {
                 if (self.surfaceForCore(target.surface)) |s| s.requestRender();
             } else {
-                for (self.surfaces.items) |s| s.requestRender();
+                for (self.windows.items) |window| {
+                    for (window.tabs.items) |tab| {
+                        var leaves: std.ArrayListUnmanaged(*Surface) = .{};
+                        defer leaves.deinit(self.alloc);
+                        tab.root.collectLeaves(self.alloc, &leaves);
+                        for (leaves.items) |s| s.requestRender();
+                    }
+                }
             }
             return true;
         },
@@ -256,32 +307,32 @@ pub fn performAction(
         // ------------------------------------------------------------------
         .toggle_fullscreen => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| s.toggleFullscreen();
+                if (self.windowForCore(target.surface)) |window| window.toggleFullscreen();
             }
             return true;
         },
 
         .toggle_maximize => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| s.toggleMaximize();
+                if (self.windowForCore(target.surface)) |window| window.toggleMaximize();
             }
             return true;
         },
 
         .toggle_window_decorations => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| s.toggleDecorations();
+                if (self.windowForCore(target.surface)) |window| window.toggleDecorations();
             }
             return true;
         },
 
         .float_window => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| {
+                if (self.windowForCore(target.surface)) |window| {
                     switch (value) {
-                        .on => s.setFloating(true),
-                        .off => s.setFloating(false),
-                        .toggle => s.setFloating(true), // simplified
+                        .on => window.setFloating(true),
+                        .off => window.setFloating(false),
+                        .toggle => window.setFloating(!window.floating),
                     }
                 }
             }
@@ -289,9 +340,8 @@ pub fn performAction(
         },
 
         .toggle_visibility => {
-            // Toggle all windows visible/hidden
-            for (self.surfaces.items) |s| {
-                win32.showWindow(s.hwnd, win32.SW_SHOW);
+            for (self.windows.items) |window| {
+                win32.showWindow(window.hwnd, win32.SW_SHOW);
             }
             return true;
         },
@@ -301,22 +351,22 @@ pub fn performAction(
         // ------------------------------------------------------------------
         .size_limit => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| s.setSizeLimit(value);
+                if (self.windowForCore(target.surface)) |window| window.setSizeLimit(value);
             }
             return true;
         },
 
         .initial_size => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| s.setInitialSize(value);
+                if (self.windowForCore(target.surface)) |window| window.setInitialSize(value);
             }
             return true;
         },
 
         .reset_window_size => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| {
-                    s.setInitialSize(.{ .width = 800, .height = 600 });
+                if (self.windowForCore(target.surface)) |window| {
+                    window.setInitialSize(.{ .width = 800, .height = 600 });
                 }
             }
             return true;
@@ -346,11 +396,11 @@ pub fn performAction(
         // ------------------------------------------------------------------
         .desktop_notification => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| {
-                    s.showDesktopNotification(value.title, value.body);
+                if (self.windowForCore(target.surface)) |window| {
+                    window.showDesktopNotification(value.title, value.body);
                 }
-            } else if (self.surfaces.items.len > 0) {
-                self.surfaces.items[0].showDesktopNotification(value.title, value.body);
+            } else if (self.windows.items.len > 0) {
+                self.windows.items[0].showDesktopNotification(value.title, value.body);
             }
             return true;
         },
@@ -364,7 +414,6 @@ pub fn performAction(
         // Config / URLs
         // ------------------------------------------------------------------
         .open_config => {
-            // Resolve the config path and open it in the default editor
             if (configpkg.preferredDefaultFilePath(self.alloc)) |path| {
                 defer self.alloc.free(path);
                 win32.shellOpen(null, path);
@@ -384,7 +433,7 @@ pub fn performAction(
         // ------------------------------------------------------------------
         .present_terminal => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| s.present();
+                if (self.windowForCore(target.surface)) |window| window.present();
             }
             return true;
         },
@@ -394,7 +443,6 @@ pub fn performAction(
         // ------------------------------------------------------------------
         .reload_config => {
             if (!value.soft) {
-                // Hard reload: re-read config from disk
                 var config = configpkg.Config.load(self.alloc) catch |err| blk: {
                     log.warn("failed to reload config: {}; keeping current", .{err});
                     break :blk null;
@@ -409,7 +457,6 @@ pub fn performAction(
                     self.config = new_clone;
                 }
             }
-            // Push config to core (updates all surfaces)
             self.core_app.updateConfig(self, &self.config) catch |err| {
                 log.warn("failed to push config update: {}", .{err});
             };
@@ -417,9 +464,6 @@ pub fn performAction(
         },
 
         .config_change => {
-            // The core has applied a new config. Update our stored copy
-            // so future surfaces pick it up.
-            // The value.config pointer is only valid for this call; clone it.
             const new_clone = value.config.clone(self.alloc) catch |err| {
                 log.warn("failed to clone config change: {}", .{err});
                 return true;
@@ -435,8 +479,8 @@ pub fn performAction(
         // ------------------------------------------------------------------
         .toggle_background_opacity => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| {
-                    s.toggleBackgroundOpacity();
+                if (self.windowForCore(target.surface)) |window| {
+                    window.toggleBackgroundOpacity();
                 }
             }
             return true;
@@ -469,11 +513,9 @@ pub fn performAction(
             return true;
         },
 
-        .color_change => return true, // renderer handles internally
-
-        .scrollbar => return true, // no native scrollbar yet
-
-        .pwd => return true, // tracked internally by core
+        .color_change => return true,
+        .scrollbar => return true,
+        .pwd => return true,
 
         .renderer_health => {
             switch (value) {
@@ -496,28 +538,54 @@ pub fn performAction(
         // ------------------------------------------------------------------
         .show_child_exited => {
             if (target == .surface) {
-                if (self.surfaceForCore(target.surface)) |s| {
-                    // Flash the taskbar to indicate the child has exited
-                    win32.flashWindow(s.hwnd);
+                if (self.windowForCore(target.surface)) |window| {
+                    win32.flashWindow(window.hwnd);
                 }
             }
             return true;
         },
 
         .command_finished => return true,
-
         .progress_report => return true,
 
         // ------------------------------------------------------------------
         // Search (not yet implemented — needs overlay UI)
         // ------------------------------------------------------------------
         .start_search => {
-            log.info("search not yet implemented on Windows", .{});
-            return false;
+            if (target == .surface) {
+                if (self.surfaceForCore(target.surface)) |s| {
+                    s.startSearch(value.needle);
+                }
+            }
+            return true;
         },
-        .end_search => return true,
-        .search_total => return true,
-        .search_selected => return true,
+
+        .end_search => {
+            if (target == .surface) {
+                if (self.surfaceForCore(target.surface)) |s| {
+                    s.endSearch();
+                }
+            }
+            return true;
+        },
+
+        .search_total => {
+            if (target == .surface) {
+                if (self.surfaceForCore(target.surface)) |s| {
+                    s.setSearchTotal(value.total);
+                }
+            }
+            return true;
+        },
+
+        .search_selected => {
+            if (target == .surface) {
+                if (self.surfaceForCore(target.surface)) |s| {
+                    s.setSearchSelected(value.selected);
+                }
+            }
+            return true;
+        },
 
         // ------------------------------------------------------------------
         // Show on-screen keyboard (not applicable on desktop Windows)
@@ -550,22 +618,85 @@ pub fn performAction(
         .inspector => return false,
 
         // ------------------------------------------------------------------
-        // Features requiring complex UI (tabs, splits, command palette, etc.)
-        // Not yet implemented in Win32 runtime.
+        // Splits
         // ------------------------------------------------------------------
+        .new_split => {
+            if (target == .surface) {
+                if (self.windowForCore(target.surface)) |window| {
+                    window.newSplit(value) catch |err| {
+                        log.warn("failed to create split: {}", .{err});
+                    };
+                }
+            }
+            return true;
+        },
+
+        .goto_split => {
+            if (target == .surface) {
+                if (self.windowForCore(target.surface)) |window| {
+                    window.gotoSplit(value);
+                }
+            }
+            return true;
+        },
+
+        .resize_split => {
+            if (target == .surface) {
+                if (self.windowForCore(target.surface)) |window| {
+                    window.resizeSplit(value);
+                }
+            }
+            return true;
+        },
+
+        .equalize_splits => {
+            if (target == .surface) {
+                if (self.windowForCore(target.surface)) |window| {
+                    window.equalizeSplits();
+                }
+            }
+            return true;
+        },
+
+        .toggle_split_zoom => {
+            if (target == .surface) {
+                if (self.windowForCore(target.surface)) |window| {
+                    window.toggleSplitZoom();
+                }
+            }
+            return true;
+        },
+
+        // ------------------------------------------------------------------
+        // Features not yet implemented
+        // ------------------------------------------------------------------
+        .goto_window => {
+            if (self.windows.items.len <= 1) return true;
+            if (target == .surface) {
+                // Find the current window index
+                const current_win = self.windowForCore(target.surface);
+                var cur_idx: usize = 0;
+                for (self.windows.items, 0..) |w_item, idx| {
+                    if (current_win != null and w_item == current_win.?) {
+                        cur_idx = idx;
+                        break;
+                    }
+                }
+                const int_val: c_int = @intFromEnum(value);
+                const next_idx: usize = if (int_val == 0)
+                    // previous
+                    if (cur_idx == 0) self.windows.items.len - 1 else cur_idx - 1
+                else
+                    // next
+                    (cur_idx + 1) % self.windows.items.len;
+                self.windows.items[next_idx].present();
+            }
+            return true;
+        },
+
         .toggle_quick_terminal,
         .toggle_command_palette,
         .toggle_tab_overview,
-        .toggle_split_zoom,
-        .equalize_splits,
-        .resize_split,
-        .goto_split,
-        .goto_tab,
-        .goto_window,
-        .move_tab,
-        .close_tab,
-        .new_tab,
-        .new_split,
         => return false,
     }
 }
@@ -587,39 +718,72 @@ pub fn redrawInspector(_: *App, _: *Surface) void {}
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Create a new terminal window surface.
-pub fn newSurface(self: *App) !*Surface {
-    const surface = try self.alloc.create(Surface);
-    errdefer self.alloc.destroy(surface);
+/// Create a new top-level terminal window with one tab.
+pub fn newWindow(self: *App) !*Window {
+    const window = try self.alloc.create(Window);
+    errdefer self.alloc.destroy(window);
 
-    try surface.init(self);
-    errdefer surface.deinit();
+    try window.init(self);
+    errdefer window.deinit();
 
-    try self.surfaces.append(self.alloc, surface);
-    return surface;
+    try self.windows.append(self.alloc, window);
+    return window;
 }
 
-/// Remove and destroy a surface. Called when a window is closed.
-pub fn removeSurface(self: *App, surface: *Surface) void {
-    for (self.surfaces.items, 0..) |s, i| {
-        if (s == surface) {
-            _ = self.surfaces.swapRemove(i);
+/// Remove and destroy a window. Called when a window is closed.
+pub fn removeWindow(self: *App, window: *Window) void {
+    for (self.windows.items, 0..) |w_item, i| {
+        if (w_item == window) {
+            _ = self.windows.swapRemove(i);
             break;
         }
     }
-    surface.deinit();
-    self.alloc.destroy(surface);
+    window.deinit();
+    self.alloc.destroy(window);
 
-    // If no surfaces remain, start the quit process
-    if (self.surfaces.items.len == 0) {
+    if (self.windows.items.len == 0) {
         self.quit_requested = true;
     }
 }
 
+/// Check if a WM_KEYDOWN message targets a search edit control and intercept
+/// Escape/Enter keys before they are dispatched normally.
+fn handleSearchKeyIntercept(self: *App, msg: *win32.MSG) bool {
+    const vk: u16 = @intCast(msg.wParam & 0xFFFF);
+    // Only intercept Escape and Enter
+    if (vk != 0x1B and vk != 0x0D) return false;
+
+    // Check if the message's target HWND belongs to a search edit
+    const target_hwnd = msg.hwnd orelse return false;
+    for (self.windows.items) |window| {
+        for (window.tabs.items) |tab| {
+            var leaves: std.ArrayListUnmanaged(*Surface) = .{};
+            defer leaves.deinit(self.alloc);
+            tab.root.collectLeaves(self.alloc, &leaves);
+            for (leaves.items) |surface| {
+                if (surface.search_edit_hwnd) |edit_hwnd| {
+                    if (edit_hwnd == target_hwnd) {
+                        return surface.onSearchKeyDown(vk);
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 /// Find the Win32 Surface that wraps the given CoreSurface.
 fn surfaceForCore(self: *App, core_surface: *CoreSurface) ?*Surface {
-    for (self.surfaces.items) |surface| {
-        if (&surface.core_surface == core_surface) return surface;
+    for (self.windows.items) |window| {
+        if (window.findSurface(core_surface)) |surface| return surface;
+    }
+    return null;
+}
+
+/// Find the Window that contains the given CoreSurface.
+fn windowForCore(self: *App, core_surface: *CoreSurface) ?*Window {
+    for (self.windows.items) |window| {
+        if (window.findSurface(core_surface) != null) return window;
     }
     return null;
 }
