@@ -71,7 +71,7 @@ The high-level ambitious plan for the project, in order:
 |  4  | Richer windowing features -- multi-window, tabbing, panes |   ✅   |
 |  5  | Native Platform Experiences (i.e. Mac Preference Panel)   |   ⚠️   |
 |  6  | Cross-platform `libghostty` for Embeddable Terminals      |   ⚠️   |
-|  7  | Windows Terminals (including PowerShell, Cmd, WSL)        |   ❌   |
+|  7  | Windows Terminals (including PowerShell, Cmd, WSL)        |   ⚠️   |
 |  N  | Fancy features (to be expanded upon later)                |   ❌   |
 
 Additional details for each step in the big roadmap below:
@@ -101,7 +101,7 @@ generally in the same performance category as the other highest performing
 terminal emulators.
 
 For rendering, we have a multi-renderer architecture that uses OpenGL on
-Linux and Metal on macOS. As far as I'm aware, we're the only terminal
+Linux and Windows, and Metal on macOS. As far as I'm aware, we're the only terminal
 emulator other than iTerm that uses Metal directly. And we're the only
 terminal emulator that has a Metal renderer that supports ligatures (iTerm
 uses a CPU renderer if ligatures are enabled). We can maintain around 60fps
@@ -121,8 +121,8 @@ feature rich.
 
 #### Richer Windowing Features
 
-The Mac and Linux (build with GTK) apps support multi-window, tabbing, and
-splits.
+The Mac, Linux (built with GTK), and Windows (native Win32) apps support
+multi-window, tabbing, and splits.
 
 #### Native Platform Experiences
 
@@ -134,9 +134,37 @@ in Zig but we do a lot of platform-native things:
   would expect such as real windowing, menu bars, a settings GUI, etc.
 - macOS uses a true Metal renderer with CoreText for font discovery.
 - The Linux app is built with GTK.
+- The Windows app is a native Win32 application with OpenGL rendering,
+  FreeType/HarfBuzz for fonts, tabs, splits, search, and PowerShell/Cmd
+  shell integration.
 
 There are more improvements to be made. The macOS settings window is still
-a work-in-progress. Similar improvements will follow with Linux.
+a work-in-progress. Similar improvements will follow with Linux and Windows.
+
+#### Windows Terminals
+
+Ghostty has experimental Windows support using native Win32 APIs. The Windows
+app includes:
+
+- Native Win32 window with OpenGL 4.x rendering via WGL
+- FreeType and HarfBuzz for font shaping (JetBrains Mono default)
+- Tabs with a custom-painted tab bar (create, close, switch, reorder)
+- Split panes (horizontal/vertical splits, navigation, resize, zoom)
+- Search overlay with incremental find
+- Full keyboard and mouse input with DPI scaling
+- Clipboard support (copy/paste)
+- PowerShell and Cmd shell integration
+- Config file support (`%LOCALAPPDATA%\ghostty\config.ghostty`)
+- Fullscreen, maximize, window decorations, always-on-top
+
+To build on Windows:
+
+```sh
+zig build -Dapp-runtime=windows -Dfont-backend=freetype
+```
+
+Some features are not yet implemented: quick terminal, command palette,
+tab overview, and inspector. These are planned for future development.
 
 #### Cross-platform `libghostty` for Embeddable Terminals
 

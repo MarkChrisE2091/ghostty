@@ -47,6 +47,10 @@ dependencies:
 
 macOS users don't require any additional dependencies.
 
+Windows users need the Zig toolchain (see `build.zig` for the required
+version). No additional dependencies are needed — FreeType, HarfBuzz, and
+OpenGL headers are vendored or linked from the system.
+
 ## Xcode Version and SDKs
 
 Building the Ghostty macOS app requires that Xcode, the macOS SDK,
@@ -66,6 +70,31 @@ sudo xcode-select --switch /Applications/Xcode.app
 >
 > You do not need to be running on macOS 26 to build Ghostty, you can
 > still use Xcode 26 on macOS 15 stable.
+
+## Windows
+
+Building Ghostty on Windows uses the native Win32 app runtime with FreeType
+for font rendering:
+
+```shell
+zig build -Dapp-runtime=windows -Dfont-backend=freetype
+```
+
+The built binary is at `zig-out/bin/ghostty.exe`. For a debug build (the
+default), a console window will also appear with debug logging. For a
+release build, add `-Doptimize=ReleaseFast`.
+
+The Windows app runtime is located in `src/apprt/windows/` and consists of:
+
+- `App.zig` — Application lifecycle and Win32 message loop
+- `Window.zig` — Top-level window with tab bar management
+- `Surface.zig` — Terminal surface (child HWND with WGL OpenGL context)
+- `SplitNode.zig` — Binary tree for split pane layout
+- `win32.zig` — Win32 API bindings and window procedures
+- `wgl.zig` — WGL OpenGL context creation
+- `key.zig` — Virtual key code to Ghostty key mapping
+
+Configuration is loaded from `%LOCALAPPDATA%\ghostty\config.ghostty`.
 
 ## AI and Agents
 
